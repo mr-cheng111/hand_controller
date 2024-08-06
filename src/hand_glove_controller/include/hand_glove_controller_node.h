@@ -15,21 +15,19 @@
 #include <mutex>
 #include "signal.h"
 //消息文件
-//#include "hand_controller_msgs/hand_controller.h"
-//#include "hand_status_msgs/hand_status.h"
+
 #include "sensor_msgs/JointState.h"
 
 using namespace std;
 
-#define UART_DEV "/dev/ttyUSB1"
+#define UART_DEV "/dev/ttyUSB0"
 
+#define HAND_GLOVE_ID 0x11
+#define ANGLE_ACT 0x1546
+#define FORCE_SET 0x1498
 
+uint8_t Hand_Force_Set[12];
 
-
-#define HAND_ID 0x01
-#define ANGLE_ACT 0x060A
-#define FORCE_ACT 0x062E
-#define ANGLE_SET 0x05CE
 
 class Send_Hand_Data_t
 {
@@ -60,7 +58,7 @@ public:
             Check_Sum -= 0x90;
             Send_Data_Buffer.push(Check_Sum & 0xff);
         }
-        else
+        else if(Read_Write == 1)
         {
             queue<uint8_t> Temp_Data;
             Temp_Data.push(0xEB);
@@ -70,6 +68,35 @@ public:
             Temp_Data.push(0x12);
             Temp_Data.push(Reg_Address & 0xff);
             Temp_Data.push((Reg_Address >> 8) & 0xff);
+            
+            if(Data != nullptr)
+            {
+                for(uint8_t i = 0; i < Register_Length; i ++)
+                {
+                    Temp_Data.push(*(Data + i));
+                }
+            }
+
+            uint16_t Check_Sum = 0;
+            uint8_t Data_Length = Temp_Data.size();
+            for(uint8_t i = 0; i < Data_Length; i++)
+            {
+                Check_Sum += Temp_Data.front();
+                Send_Data_Buffer.push(Temp_Data.front());
+                Temp_Data.pop();
+            }
+            Check_Sum -= 0xEB;
+            Check_Sum -= 0x90;
+            Send_Data_Buffer.push(Check_Sum & 0xff); 
+        }
+        else if(Read_Write == 2 )
+        {
+            queue<uint8_t> Temp_Data;
+            Temp_Data.push(0xEB);
+            Temp_Data.push(0x90);
+            Temp_Data.push(Hand_ID);
+            Temp_Data.push(Register_Length + 1);
+            Temp_Data.push(0x31);
             
             if(Data != nullptr)
             {
@@ -181,8 +208,8 @@ public:
         options.c_cflag &= ~PARENB;    //PARENB允许输出产生奇偶信息以及输入的奇偶校验,加~就是无校验
     
         /* c_cc[NCCS] 控制字符 */
-        options.c_cc[VTIME] = 1 ;   //等待数据时间(10秒的倍数),每个单位是0.1秒  若20就是2秒
-        options.c_cc[VMIN] = 20 ;    //最少可读数据,非规范模式读取时的最小字符数，设为0则为非阻塞，如果设为其它值则阻塞，直到读到到对应的数据,就像一个阀值一样，比如设为8，如果只接收到3个数据，那么它是不会返回的，只有凑齐8个数据后一齐才READ返回，阻塞在那儿
+        options.c_cc[VTIME] = 0.5;   //等待数据时间(10秒的倍数),每个单位是0.1秒  若20就是2秒
+        options.c_cc[VMIN] = 18;    //最少可读数据,非规范模式读取时的最小字符数，设为0则为非阻塞，如果设为其它值则阻塞，直到读到到对应的数据,就像一个阀值一样，比如设为8，如果只接收到3个数据，那么它是不会返回的，只有凑齐8个数据后一齐才READ返回，阻塞在那儿
         /* 
         如果这样设置，就完全阻塞了，只有串口收到至少8个数据才会对READ立即返回，或才少于8个数据时，超时2秒也会有返回
         另外特别注意的是当设置VTIME后，如果read第三个参数小于VMIN ，将会将VMIN 修改为read的第三个参数*/
@@ -200,10 +227,10 @@ public:
         //==========串口接收(字符串)============//
         while(((RxLen = read(fd, RxBuff,sizeof(RxBuff))) > 0))
         {            
-            if(RxLen == 20)
+            if(RxLen == 18)
             {
-                memcpy(ptr,RxBuff,20);
-                *Rx_Data_Len = 20;
+                memcpy(ptr,RxBuff,18);
+                *Rx_Data_Len = 18;
                 return ;
             }
         }
@@ -239,14 +266,14 @@ public:
         //状态初始化
         //*ID = 1;
 
-        ros::init(argc_,argv_,"hand");
+        ros::init(argc_,argv_,"hand_glove");
 
         hand_glove_controller_node = new ros::NodeHandle;
 
-        pub_hand_glove_status = hand_glove_controller_node->advertise<sensor_msgs::JointState>("/hand_status", 1); //把这个节点设置成发布者，并把发布主题的类型告诉节点管理器，第一个参数是消息名称。
+        pub_hand_glove_status = hand_glove_controller_node->advertise<sensor_msgs::JointState>("/hand_control", 1000); //把这个节点设置成发布者，并把发布主题的类型告诉节点管理器，第一个参数是消息名称。
 
         //订阅灵巧手的控制回调，每当有控制值到来时触发，控制topic为hand_controll
-        sub_hand_glove_controller = hand_glove_controller_node->subscribe("/hand_control", 1, Hand_Control_topic_callback);
+        sub_hand_glove_controller = hand_glove_controller_node->subscribe("/hand_status", 1, Hand_Glove_Control_topic_callback);
 
         //创建手势获取任务
         pthread_create(&threads[0], NULL, Get_Hand_Glove_Status_Task, NULL);
@@ -260,40 +287,18 @@ public:
     }
 
     /*ROS控制消息回调函数*/
-    static void Hand_Control_topic_callback(const sensor_msgs::JointState &msg)
+    static void Hand_Glove_Control_topic_callback(const sensor_msgs::JointState &msg)
     {
-        //控制值目标角度大于设定值
-        // if(msg.position[0] > 1000 || msg.position[1] > 1000 || msg.position[2] > 1000 || msg.position[3] > 1000 || msg.position[4] > 1000 || msg.position[5] > 1000)
-        // {
-        //     return ;
-        // }
-        
-        uint8_t Hand[12] = {0};
-        // cout << "****************" << endl;
         //获取控制值
-        for(uint8_t i = 0; i < msg.position.size(); i ++)
+        for(uint8_t i = 0; i < msg.effort.size(); i ++)
         {
-            Hand[2*i + 0] = (uint8_t) (((int16_t)msg.position[i]) & 0xff);
-            Hand[2*i + 1] = (uint8_t)((((int16_t)msg.position[i]) >> 8) & 0xff);
-            // cout << msg.position[i] << endl;
+            Hand_Force_Set[2*i + 0] = (uint8_t) ((int16_t)(0.7 * msg.effort[i]) & 0xff);
+            Hand_Force_Set[2*i + 1] = (uint8_t)(((int16_t)(0.7 * msg.effort[i]) >> 8) & 0xff);
+            
+            // cout << "*******" << endl;
+            // cout << msg.effort[i] << endl;
+            // cout << hex <<unsigned(Hand_Force_Set[2*i + 1]) << " " << unsigned(Hand_Force_Set[2*i + 0]) << endl;
         }
-        
-        Send_Hand_Data_t Get_Control_Command(1,ANGLE_SET,0x0C, Hand,1);
-
-        uint8_t Temp[20];
-        size_t a;
-        Get_Control_Command.Get_Send_Data(Temp,&a);
-        // for(uint8_t i = 0; i < a ; i ++)
-        // {
-        //     cout << hex << unsigned(Temp[i]) << endl;
-        // }
-        
-        uint8_t *Tx_Data = new uint8_t(20);
-        size_t Tx_Data_Len = 0;
-        Get_Control_Command.Get_Send_Data(Tx_Data,&Tx_Data_Len);
-        Serial_Lock.lock();//获取Serial锁
-        Serial.Send_Data(Tx_Data,Tx_Data_Len);
-        Serial_Lock.unlock();//释放Serial锁
     }
 
     /*灵巧手状态获取任务*/
@@ -302,22 +307,16 @@ public:
         uint8_t Rx_Data[1024],Rx_Data_Len;
         while(1)
         {
+            // cout << "111111111111" << endl;
             //得到获取状态指令
-            Send_Hand_Data_t Get_Status_Command1(ID,ANGLE_ACT,12,nullptr,0);
-            Send_Hand_Data_t Get_Status_Command2(ID,FORCE_ACT,12,nullptr,0);
-            uint8_t *Tx_Data1 = new uint8_t(32);
-            uint8_t *Tx_Data2 = new uint8_t(32);
+            Send_Hand_Data_t Get_Status_Command(HAND_GLOVE_ID, FORCE_SET, 0x0D, Hand_Force_Set, 2);
+            uint8_t *Tx_Data = new uint8_t(32);
             size_t Tx_Data_Len = 0;
-            Get_Status_Command1.Get_Send_Data(Tx_Data1, &Tx_Data_Len);
-            Get_Status_Command2.Get_Send_Data(Tx_Data2, &Tx_Data_Len);
-            Serial_Lock.lock();//等待锁
-            Serial.Send_Data(Tx_Data1, Tx_Data_Len);
-            Serial_Lock.unlock();//解锁
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            Serial_Lock.lock();//等待锁
-            Serial.Send_Data(Tx_Data2, Tx_Data_Len);
-            Serial_Lock.unlock();//解锁
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            Get_Status_Command.Get_Send_Data(Tx_Data, &Tx_Data_Len);
+            // Serial_Lock.lock();//等待锁
+            Serial.Send_Data(Tx_Data, Tx_Data_Len);
+            // Serial_Lock.unlock();//解锁
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
     }
@@ -331,65 +330,48 @@ public:
         while(1)
         {
             Serial.Get_Data(Rx_Data,&Rx_Data_Len);
-            if(Flag == 0)
+            hand_status = new sensor_msgs::JointState;
+            Solve_Date(Rx_Data, Rx_Data_Len, hand_status, &Flag);
+            if(Flag == true)
             {
-                hand_status = new sensor_msgs::JointState;
-                Solve_Date(Rx_Data, Rx_Data_Len, hand_status, &Flag);
-            }
-            else if(Flag == 1)
-            {
-                Solve_Date(Rx_Data, Rx_Data_Len, hand_status, &Flag);
-                if(hand_status->position.size() == 6)
-                {
-                    hand->pub_hand_glove_status.publish(*hand_status);
-                }
+                hand->pub_hand_glove_status.publish(*hand_status);
                 delete hand_status;
-                Flag = 0;
+                Flag = false;
             }
         }
     }
 
-    static void Solve_Date(uint8_t *Rx_Data,uint8_t Rx_Data_Len, sensor_msgs::JointState *hand_status_temp,uint8_t *Flag)
+    static void Solve_Date(uint8_t *Rx_Data,uint8_t Rx_Data_Len, sensor_msgs::JointState *hand_status_temp, uint8_t *Flag)
     {
-        if(Rx_Data_Len != 20)
-        {
-            return;
-        }
+            //         cout << unsigned(Rx_Data_Len) << endl;
+            // for(uint16_t i = 0; i < Rx_Data_Len; i++ )
+            // {
+            //     cout << hex << unsigned(Rx_Data[i]) << " ";
+            // }
+            // cout << endl;
+
         if((Rx_Data[0] << 8 | Rx_Data[1]) == 0x90EB)
         {
-            
             uint8_t Temp_Data = 0;
-            for(uint8_t i = 2; i < Rx_Data_Len - 1; i ++)
+            for(uint8_t i = 2; i < 18 - 1; i ++)
             {
                 Temp_Data += Rx_Data[i];
             }
-            if(Temp_Data == Rx_Data[Rx_Data_Len - 1])
+            if(Temp_Data == Rx_Data[18 - 1])
             {
-                hand_status_temp->header.frame_id =  "Hand";
+                hand_status_temp->header.frame_id =  "Hand_Glove";
                 hand_status_temp->header.seq = 1;
                 hand_status_temp->header.stamp = ros::Time::now();
-                // int temp_data = (Rx_Data[6] << 8| Rx_Data[5]);
-                // cout << hex << temp_data << endl;
-                if((Rx_Data[6] << 8| Rx_Data[5]) == 0x060A)
+                for(uint8_t i = 0; i < 6; i++)
                 {
-                    for(uint8_t i = 0; i < 6; i++)
-                    {
-                        hand_status_temp->position.push_back((int16_t) (Rx_Data[8 + 2*i] << 8 | Rx_Data[7 + 2*i]));
-                    }
-                    *Flag = 1;
+                    hand_status_temp->position.push_back((int16_t) Rx_Data[6 + 2*i] << 8 | Rx_Data[5 + 2*i]);
+
+                    //cout << "Joint:" << unsigned(i)  << " " << (int16_t)( Rx_Data[6 + 2*i] << 8 | Rx_Data[5 + 2*i] )<< endl;
                 }
-                else if((Rx_Data[6] << 8| Rx_Data[5]) == 0x062E)
-                {
-                    for(uint8_t i = 0; i < 6; i++)
-                    {
-                        hand_status_temp->effort.push_back((int16_t) (Rx_Data[8 + 2*i] << 8 | Rx_Data[7 + 2*i]));
-                    }
-                }
-                
+                *Flag = true;
             }
         }
     }
-
     static void ros_exit(int sig)
     {
         ROS_INFO("shutting down!");
